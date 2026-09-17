@@ -1,7 +1,7 @@
 # Cordis (Go)
 
 > 论文《Spatiotemporal Composability》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 24 项测试全绿（含 `-race`）。
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 24 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -346,3 +346,27 @@ stateDiagram-v2
 - 论文《Spatiotemporal Composability》—— 时空可组合组件模型的理论来源
 - 官方 TypeScript 实现 —— 本仓库逐模块对照的语义基准（概念映射见 §2）
 - 包级设计说明见 `cordis.go` 顶部注释；各模块内部设计取舍见对应源文件注释
+
+---
+
+## 12. 许可
+
+本项目采用 [Apache License 2.0](LICENSE) 授权，全文见仓库根目录 `LICENSE`。
+
+```
+Copyright 2026 metaRobin
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+> 注意：本仓库对照的**官方 TypeScript 实现**为独立项目，其授权与本仓库无关；论文版权归原作者所有。
