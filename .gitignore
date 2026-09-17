@@ -1,4 +1,5 @@
 .DS_Store
+.workbuddy/
 .trae-html-share-packages/cordis-go-impl-summary/cordis-go-impl-summary.html.zip
 cordis-go-impl-summary/cordis-go-impl-summary.html
 cordis-go-impl-summary/plan.md
