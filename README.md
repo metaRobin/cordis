@@ -341,31 +341,7 @@ stateDiagram-v2
 
 ---
 
-## 11. 已知限制
-
-以下条目来自本仓库代码审查结论，**除已修复项外均尚未落地修复**，使用前请知悉：
-
-| 编号 | 级别 | 问题 | 位置 |
-| --- | --- | --- | --- |
-| ~~H-1~~ | ~~高~~ | ~~调度器队列固定 1024 容量导致自死锁~~ | **已修复**：改为无界队列，并由 `TestSchedulerUnboundedQueue` 锁定 |
-| M-1 | 中 | `reconcile` 对跨组重复短 ID 静默覆盖扁平索引（`Create` 有查重，`reconcile` 无） | `loader.go` |
-| M-2 | 中 | `PluginInject` 在 `Validate` 失败时返回 `(fiber, nil)`，错误契约被打破（失败只走 Fiber 状态通道） | `registry.go` |
-| M-3 | 中 | 服务变更通知每次全量扫描 `Runtime × Fiber`，大规模入口树下为 O(N²) | `reflect.go` |
-| L-1 | 低 | `safeDispose` 吞 panic 且未记录日志（注释与实现不符） | `fiber.go` |
-| L-2 | 低 | 撤销窗口内非依赖者 `Get` 可能读到已摘除的服务值 | `reflect.go` / `context.go` |
-| L-3 | 低 | `Wait` 轮询上限耗尽后静默返回，无法区分「稳定」与「放弃」 | `app.go` |
-| L-4 | 低 | 短 ID 全局唯一约束与路径式寻址不一致，未文档化 | `loader.go` |
-| N-3 | 细节 | 分组配置类型断言失败时静默清空全部子入口 | `loader.go` |
-
-**其他约束**
-
-- 运行时约定「所有 API 只在调度器内调用」。跨 goroutine 使用必须经 `Do` / `DoSync`，否则行为未定义（无锁保护）。
-- 模块路径为裸名 `cordis`，不便直接 `go get`。
-- 未指定开源许可。
-
----
-
-## 12. 参考
+## 11. 参考
 
 - 论文《Spatiotemporal Composability》—— 时空可组合组件模型的理论来源
 - 官方 TypeScript 实现 —— 本仓库逐模块对照的语义基准（概念映射见 §2）
