@@ -1,5 +1,7 @@
 # Cordis (Go)
 
+[![CI](https://github.com/metaRobin/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/metaRobin/cordis/actions/workflows/ci.yml)
+
 > 论文《Spatiotemporal Composability》所提出的**时空可组合组件模型**的纯 Go 实现。
 > 零第三方依赖 · 单 goroutine 免锁运行时 · 35 项测试全绿（含 `-race`）· Apache-2.0
 
@@ -325,6 +327,8 @@ stateDiagram-v2
 ## 10. 测试覆盖
 
 `go test ./...` → **35 项全部通过**；`go test -race ./...` 无竞态报告；另有 2 个基准（`-bench .`）。
+
+CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
 **核心运行时（`cordis_test.go`，19 项）**
 

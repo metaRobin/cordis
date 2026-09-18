@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的旧运行在新提交到达时取消，避免排队浪费。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.22.x 是 go.mod 声明的最低版本（支持下限必须实测）；
+        # stable 覆盖最新工具链，防止只在旧版本上通过。
+        # 若日后 go.mod 提升 go 指令，1.22.x 这一档会明确失败——
+        # 那是预期信号：声明的最低版本已不再受支持。
+        go: ["1.22.x", "stable"]
+    env:
+      # 禁止自动切换工具链，确保矩阵中的版本就是实际运行的版本。
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt required for the following files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # 竞态检测是常态检查项：本实现的正确性依赖单 goroutine 免锁
+      # 模型，任何越界访问都只在 -race 下暴露。
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # 基准需能被编译并实际运行（规模回归的观测手段）。
+      - name: benchmarks
+        run: go test -run '^$' -bench . -benchtime 10x ./...
+
+      # 端到端冒烟：示例覆盖热重载、依赖降级与隔离域三条主路径。
+      - name: example smoke test
+        run: go run ./example
