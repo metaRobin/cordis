@@ -30,12 +30,15 @@ jobs:
       # 禁止自动切换工具链，确保矩阵中的版本就是实际运行的版本。
       GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      # 零第三方依赖 ⇒ 无 go.sum 可缓存，显式关闭缓存以免每次
+      # 运行都尝试恢复依赖缓存并报 "Dependencies file is not found"。
+      # 若日后引入依赖，改回 cache: true 即可。
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
-          cache: true
+          cache: false
 
       - name: gofmt
         run: |
