@@ -1,7 +1,7 @@
 # Cordis (Go)
 
 > 论文《Spatiotemporal Composability》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 24 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 35 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -63,18 +63,19 @@ flowchart TD
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `cordis.go` | 92 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
-| `app.go` | 212 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
-| `context.go` | 195 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
-| `fiber.go` | 554 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、配置热更新 |
-| `reflect.go` | 188 | 协效应存储、域键解析、提供者变更通知（dependant-first） |
-| `registry.go` | 180 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
-| `events.go` | 188 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel`）与 `Logger` |
+| `cordis.go` | 93 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
+| `app.go` | 225 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
+| `context.go` | 203 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
+| `fiber.go` | 560 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、配置热更新 |
+| `reflect.go` | 241 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
+| `registry.go` | 191 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
+| `events.go` | 189 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel`）与 `Logger` |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
-| `loader.go` | 714 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
+| `loader.go` | 788 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 666 | 核心运行时测试（15 项） |
-| `loader_test.go` | 416 | 声明式配置层测试（9 项） |
+| `cordis_test.go` | 912 | 核心运行时测试（19 项 + 2 基准） |
+| `loader_test.go` | 707 | 声明式配置层测试（15 项 + 1 基准） |
+| `index_internal_test.go` | 60 | 依赖倒排索引的生命周期不变量（白盒） |
 
 ---
 
@@ -84,7 +85,7 @@ flowchart TD
 git clone git@github-metaRobin:metaRobin/cordis.git
 cd cordis
 
-go test ./...          # 24 项测试
+go test ./...          # 35 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -208,16 +209,17 @@ loader.Load([]cordis.EntryOptions{
 | `Load(options)` | 整体协调：新增创建、缺失移除、存留更新，顺序以配置为准 |
 | `Create` / `Remove` / `Update` | 单入口增删改；`Update` 支持跨组移动（触发上下文重建 + 完整重载） |
 | `EntryGroup` | 分组入口，`Group: true`；禁用级联会禁用全部后代 |
+| `EntryOptions.ID` | **全树唯一**（索引以短 ID 为键，寻址用 `group:child` 路径）；重复 ID 被拒绝（跳过并记日志） |
 | `EntryOptions.Inject` | 入口级依赖增删覆盖（`cordis.DepRemove` 显式移除声明的依赖） |
 | `EntryTree.OnCommit` | 每次结构变更后同步回调，供持久化落盘 |
 | `NewLoader` | 同名插件可多次实例化，共享 `Runtime` |
 
 配置变更的分派规则（`Entry.update`）：
 
-- 禁用（含级联）→ 注销 Fiber；
-- 空间声明变化（`Name` / `Group` / `Inject` / `Isolate` / `Intercept`）→ 重建上下文并完整重载；
-- 仅 `Config` 变化 → 走 `Fiber.Update` 热重载；
-- 分组入口 → 通过更新钩子协调子入口，而非重启自身。
+- 禁用（含级联）→ 注销 Fiber 并摘下分组子树；
+- 空间声明变化（`Name` / `Group` / `Inject` / `Isolate` / `Intercept`）→ **同步摘下旧子树**、注销旧实例，再以新声明完整重载（旧实例的效果回收是异步的，子树结构必须立即一致，否则重建时短 ID 索引冲突）；
+- 仅 `Config` 变化 → 走 `Fiber.Update` 热重载；配置未过 `Validate` 时 Fiber 进入 `failed` 并保留在入口上，修正后原地恢复；
+- 分组入口 → 通过更新钩子协调子入口，而非重启自身；分组配置类型错误（非 `[]EntryOptions`）记日志并保留现有子入口。
 
 ---
 
@@ -230,7 +232,7 @@ loader.Load([]cordis.EntryOptions{
 - ⚠️ **不得在调度器上下文内调用 `DoSync` / `Wait`** —— 会死锁。
 - 任务队列为**无界 slice + 互斥锁**（不是固定容量 channel）：单个任务内部继续投递任务不会自阻塞，语义与 JS 事件循环一致。
 
-`App.Wait()` 阻塞至队列排空且全部 Fiber 稳定；`App.Close()` 冻结根 fiber 目标视图，沿效果链级联回收全部子组件并停止调度器（可安全重复调用）。
+`App.Wait()` 阻塞至队列排空且全部 Fiber 稳定，**返回是否真正收敛**（调度器已停止或达到轮询上限后放弃时返回 `false` 并告警）；`App.Close()` 冻结根 fiber 目标视图，沿效果链级联回收全部子组件并停止调度器（可安全重复调用）。
 
 ---
 
@@ -270,9 +272,9 @@ stateDiagram-v2
 | 方法 | 说明 |
 | --- | --- |
 | `New()` | 创建应用并启动调度器 |
-| `Do(f)` / `DoSync(f)` | 在调度器上异步 / 同步执行 |
+| `Do(f)` / `DoSync(f)` | 在调度器上异步 / 同步执行；`DoSync` 返回任务是否确实执行完毕 |
 | `Root()` | 根上下文（仅限调度器上下文使用） |
-| `Wait()` | 等待系统稳定 |
+| `Wait()` | 等待系统稳定，返回是否收敛 |
 | `Close()` | 级联回收全部组件并停止调度器 |
 | `Logger()` | 取日志器（`Error` / `Warn` / `Info` 均可替换） |
 
@@ -280,13 +282,21 @@ stateDiagram-v2
 
 | 方法 | 说明 |
 | --- | --- |
-| `Get(name)` / `GetMust(name)` | 解析服务（沿 Fiber 链向上，域感知） |
+| `Get(name)` / `GetMust(name)` | 解析服务（沿 Fiber 链向上，域感知；提供者未 `active` 时视为不可见） |
 | `Provide(name, value, check)` | 注册服务，返回与 Fiber 绑定的 `Dispose` |
 | `Set(name, value)` | 更新本 Fiber 已注册的服务值 |
 | `Effect` / `EffectIter` / `On` / `Once` / `Emit` | 效果与事件 |
 | `Isolate(name, realm)` / `Intercept(name, cfg)` / `InterceptOf(name)` | 空间维声明 |
 | `Plugin(p, config)` / `Inject(deps, apply)` | 实例化组件 / 声明动态依赖 |
 | `App()` / `Fiber()` / `Root()` / `Entry()` | 上下文导航 |
+
+### `Registry` 的错误契约
+
+| 返回 | 含义 |
+| --- | --- |
+| `(nil, err)` | 结构性失败（插件无效或父上下文已失活），Fiber 从未注册 |
+| `(f, err)` | 配置未通过 `Validate`——Fiber 已注册且处于 `failed`，可经 `f.Update` 修复或 `f.Dispose` 注销 |
+| `(f, nil)` | 成功 |
 
 ### `Fiber`
 
@@ -314,9 +324,9 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **24 项全部通过**；`go test -race ./...` 无竞态报告。
+`go test ./...` → **35 项全部通过**；`go test -race ./...` 无竞态报告；另有 2 个基准（`-bench .`）。
 
-**核心运行时（`cordis_test.go`，15 项）**
+**核心运行时（`cordis_test.go`，19 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -326,18 +336,38 @@ stateDiagram-v2
 | `TestIsolation` / `TestSharedRealm` | 私有域 / 共享域语义 |
 | `TestHotReload` | 配置热重载 |
 | `TestFailureAndRecovery` | `apply` 失败与 `Update` 恢复 |
-| `TestConfigValidation` | `Validate` 校验失败路径 |
+| `TestConfigValidation` / `TestPluginErrorContract` | `Validate` 失败路径与错误契约 |
 | `TestServiceEvents` | `internal/service` 事件 |
 | `TestDuplicateProvide` | 同域重复注册 |
 | `TestEpochChase` | 转换期间 epoch 再次变化的追逐 |
 | `TestEventListenerCleanup` | 监听器随 Fiber 回收 |
 | `TestRootCloseCascades` | 根关闭级联 |
 | `TestCheckFunction` | `check` 不健康判定 |
+| `TestServiceHiddenWhileProviderUnloading` | 撤销窗口内服务可见性 |
+| `TestDisposePanicLogged` | 撤销 panic 被记录且不阻断后续 |
+| `TestWaitReportsConvergence` | `Wait` / `DoSync` 的收敛与执行结果上报 |
 | `TestSchedulerUnboundedQueue` | 单任务内超量投递不自死锁 |
 
-**声明式配置层（`loader_test.go`，9 项）**
+**声明式配置层（`loader_test.go`，15 项）**
 
-`TestLoaderBasicLoad` · `TestLoaderReconcile` · `TestLoaderConfigReload` · `TestLoaderGroup` · `TestLoaderEntryIsolate` · `TestLoaderEntryInject` · `TestLoaderTreeOperations` · `TestLoaderCommitHook` · `TestLoaderSelfDispose`
+| 测试 | 覆盖点 |
+| --- | --- |
+| `TestLoaderBasicLoad` / `TestLoaderReconcile` / `TestLoaderConfigReload` | 加载、整体协调、配置热重载 |
+| `TestLoaderGroup` / `TestLoaderGroupIsolateRebuild` / `TestLoaderGroupConfigTypeError` | 分组协调、空间声明变化重建、配置类型错误保留子树 |
+| `TestLoaderEntryIsolate` / `TestLoaderEntryInject` | 入口级域与依赖声明 |
+| `TestLoaderTreeOperations` / `TestLoaderGroupMoveRebuild` | 入口树增删改与跨组移动（含分组子树同步摘下重建） |
+| `TestLoaderDuplicateShortID` | 重复短 ID 拒绝（含跨组） |
+| `TestLoaderConfigErrorRecovery` | 校验失败后原地恢复 |
+| `TestLoaderCommitHook` / `TestLoaderSelfDispose` | 提交钩子、插件自行卸载 |
+| `TestLoaderLargeLoad` | 1100 入口单次 Load 不死锁 |
+
+**内部不变量（`index_internal_test.go`，1 项，白盒）**
+
+`TestReflectIndexLifecycle` —— 依赖倒排索引的 track/untrack 严格配对（注销、未注册失败路径与 `Close` 级联后索引回空）
+
+**基准**
+
+`BenchmarkServiceNotify`（服务上下线通知代价，倒排索引前后对比见提交历史）· `BenchmarkLoaderLoad`（声明式协调吞吐）
 
 ---
 
