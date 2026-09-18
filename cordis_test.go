@@ -2,6 +2,7 @@ package cordis_test
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -401,12 +402,18 @@ func TestConfigValidation(t *testing.T) {
 		},
 		Apply: func(*cordis.Context, any) error { return nil },
 	}
-	var f *cordis.Fiber
+	var (
+		f   *cordis.Fiber
+		err error
+	)
 	h.run(func(ctx *cordis.Context) {
-		f, _ = ctx.Plugin(p, 42)
+		f, err = ctx.Plugin(p, 42)
 	})
-	if f.State() != cordis.StateFailed {
-		t.Fatalf("invalid config should fail the fiber, got %s", f.State())
+	if err == nil {
+		t.Fatal("invalid config must return an error")
+	}
+	if f == nil || f.State() != cordis.StateFailed {
+		t.Fatalf("invalid config should register a FAILED fiber, got %v", f)
 	}
 	h.run(func(ctx *cordis.Context) {
 		if err := f.Update("ok"); err != nil {
@@ -416,6 +423,48 @@ func TestConfigValidation(t *testing.T) {
 	if f.State() != cordis.StateActive {
 		t.Fatalf("valid config should activate, got %s", f.State())
 	}
+}
+
+// 回归（M-2）：PluginInject 的错误契约——
+// 结构性失败返回 (nil, err)；配置校验失败返回 (f, err)，
+// fiber 处于 FAILED 且注销句柄已接线（Dispose 后注册表清空）。
+func TestPluginErrorContract(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	h.run(func(ctx *cordis.Context) {
+		if f, err := ctx.Plugin(&cordis.Plugin{Name: "bad"}, nil); err == nil || f != nil {
+			t.Fatalf("invalid plugin must return (nil, err), got (%v, %v)", f, err)
+		}
+	})
+
+	p := &cordis.Plugin{
+		Name: "strict",
+		Validate: func(config any) (any, error) {
+			if s, ok := config.(string); ok {
+				return s, nil
+			}
+			return nil, fmt.Errorf("config must be string")
+		},
+		Apply: func(*cordis.Context, any) error { return nil },
+	}
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		if f, err = ctx.Plugin(p, 42); err == nil {
+			t.Fatal("validation failure must return an error")
+		}
+	})
+	if f == nil || f.State() != cordis.StateFailed {
+		t.Fatalf("validation failure should register a FAILED fiber, got %v", f)
+	}
+
+	h.run(func(ctx *cordis.Context) {
+		f.Dispose()
+		if ctx.Registry().Has(p) {
+			t.Fatal("disposed failed fiber should unregister its runtime")
+		}
+	})
 }
 
 func TestServiceEvents(t *testing.T) {
@@ -662,5 +711,202 @@ func TestSchedulerUnboundedQueue(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("deadlock: >1024 posts from a single scheduler task")
+	}
+}
+
+// 回归（L-1）：撤销回调 panic 必须被记录，且不阻断其余撤销步骤。
+func TestDisposePanicLogged(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var logged []string
+	h.app.Logger().Error = func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	var order []string
+	p := &cordis.Plugin{
+		Name: "panicky",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			if _, err := ctx.Effect("boom", func() (cordis.Dispose, error) {
+				return func() { panic("dispose exploded") }, nil
+			}); err != nil {
+				return err
+			}
+			_, err := ctx.Effect("after", func() (cordis.Dispose, error) {
+				return func() { order = append(order, "after-") }, nil
+			})
+			return err
+		},
+	}
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		f, _ = ctx.Plugin(p, nil)
+	})
+	h.run(func(ctx *cordis.Context) {
+		f.Dispose()
+	})
+
+	// LIFO：after 先撤销、boom 后撤销并 panic——panic 不推翻已完成的步骤。
+	if fmt.Sprint(order) != fmt.Sprint([]string{"after-"}) {
+		t.Fatalf("panic must not break remaining disposals: %v", order)
+	}
+	found := false
+	for _, line := range logged {
+		if strings.Contains(line, "dispose panic") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dispose panic must be logged, got %v", logged)
+	}
+}
+
+// 回归（L-2）：服务撤销窗口（提供者 state=unloading、自身服务表
+// 尚未清理）内，未声明依赖的旁观 fiber 不得经 Get 读到该实现；
+// 提供者自身的撤销路径仍可访问自己的服务。
+func TestServiceHiddenWhileProviderUnloading(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var bystanderCtx *cordis.Context
+	var (
+		active struct {
+			v  any
+			ok bool
+		}
+		duringUnload struct {
+			v  any
+			ok bool
+		}
+		selfView struct {
+			v  any
+			ok bool
+		}
+	)
+
+	bystander := &cordis.Plugin{
+		Name: "bystander",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			bystanderCtx = ctx // 未声明对 db 的依赖
+			return nil
+		},
+	}
+	provider := &cordis.Plugin{
+		Name: "db",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			if _, err := ctx.Provide("db", "conn", nil); err != nil {
+				return err
+			}
+			if _, err := ctx.Plugin(bystander, nil); err != nil {
+				return err
+			}
+			// 卸载期探测：此刻提供者尚未完成效果回收。
+			_, err := ctx.Effect("probe", func() (cordis.Dispose, error) {
+				return func() {
+					duringUnload.v, duringUnload.ok = bystanderCtx.Get("db")
+					selfView.v, selfView.ok = ctx.Get("db")
+				}, nil
+			})
+			return err
+		},
+	}
+
+	var db *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		db, _ = ctx.Plugin(provider, nil)
+	})
+	h.run(func(ctx *cordis.Context) {
+		active.v, active.ok = bystanderCtx.Get("db")
+	})
+	if !active.ok || active.v != "conn" {
+		t.Fatalf("active provider should be visible: %v %v", active.v, active.ok)
+	}
+
+	h.run(func(ctx *cordis.Context) {
+		db.Dispose()
+	})
+	if duringUnload.ok {
+		t.Fatalf("half-reverted service must be invisible to bystanders, got %v", duringUnload.v)
+	}
+	if !selfView.ok || selfView.v != "conn" {
+		t.Fatalf("provider must keep access to its own service while unloading: %v %v", selfView.v, selfView.ok)
+	}
+}
+
+// 回归（L-3）：Wait / DoSync 报告收敛与执行结果，不再静默吞掉。
+func TestWaitReportsConvergence(t *testing.T) {
+	app := cordis.New()
+	if !app.Wait() {
+		t.Fatal("fresh app should be settled")
+	}
+
+	var (
+		ran bool
+		err error
+	)
+	if !app.DoSync(func(ctx *cordis.Context) {
+		ran = true
+		_, err = ctx.Provide("s", 1, nil)
+	}) {
+		t.Fatal("DoSync should report the task ran")
+	}
+	if !ran || err != nil {
+		t.Fatalf("provide failed: ran=%v err=%v", ran, err)
+	}
+	if !app.Wait() {
+		t.Fatal("app should settle after a provide")
+	}
+
+	app.Close()
+	if app.Wait() {
+		t.Fatal("Wait must report false once the scheduler is stopped")
+	}
+	if app.DoSync(func(*cordis.Context) {}) {
+		t.Fatal("DoSync must report false once the scheduler is stopped")
+	}
+}
+
+// BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明
+// 该依赖的 Fiber 在场时，单次 provide/dispose 的耗时。
+// 引入倒排索引前该路径逐 fiber 全量扫描（O(全部 Fiber)）。
+func BenchmarkServiceNotify(b *testing.B) {
+	app := cordis.New()
+	defer app.Close()
+
+	unrelated := &cordis.Plugin{
+		Name:   "unrelated",
+		Inject: map[string]any{"never": nil},
+		Apply:  func(*cordis.Context, any) error { return nil },
+	}
+	var setupErr error
+	app.DoSync(func(ctx *cordis.Context) {
+		for i := 0; i < 1000; i++ {
+			if _, err := ctx.Plugin(unrelated, nil); err != nil {
+				setupErr = err
+				return
+			}
+		}
+	})
+	if setupErr != nil {
+		b.Fatal(setupErr)
+	}
+	app.Wait()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var perr error
+		app.DoSync(func(ctx *cordis.Context) {
+			d, err := ctx.Provide("other", i, nil)
+			if err != nil {
+				perr = err
+				return
+			}
+			d()
+		})
+		if perr != nil {
+			b.Fatal(perr)
+		}
+		app.Wait()
 	}
 }

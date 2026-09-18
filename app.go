@@ -136,11 +136,11 @@ func (a *App) Do(f func(ctx *Context)) {
 	a.sched.post(func() { f(a.root) })
 }
 
-// DoSync 在调度器上执行 f 并阻塞等待完成。
+// DoSync 在调度器上执行 f 并阻塞等待完成，返回 f 是否确实执行完毕：
+// false 表示调度器已停止，f 可能已被排空执行、也可能未执行。
 // 不得在 Apply / Dispose / 事件回调等调度器上下文中调用（会死锁）。
-// 调度器已停止时立即返回（f 不再执行）。
-func (a *App) DoSync(f func(ctx *Context)) {
-	a.doSync(f)
+func (a *App) DoSync(f func(ctx *Context)) bool {
+	return a.doSync(f)
 }
 
 func (a *App) doSync(f func(ctx *Context)) bool {
@@ -162,21 +162,34 @@ func (a *App) doSync(f func(ctx *Context)) bool {
 // Root 返回根上下文。仅在调度器上下文（Apply 等）中使用。
 func (a *App) Root() *Context { return a.root }
 
-// Wait 阻塞直到任务队列排空且所有 Fiber 达到稳定状态。
-// 存在等待外部事件（如服务提供者尚未注册）的不稳定 Fiber 时，
-// Wait 会在队列排空后返回，不无限等待。
-func (a *App) Wait() {
-	for i := 0; i < 1<<20; i++ {
+// waitRounds 是 Wait 的轮询上限，仅用于防御病态活锁（依赖永远
+// 无法满足且持续有新任务投递）。
+const waitRounds = 1 << 20
+
+// Wait 阻塞直到任务队列排空且所有 Fiber 达到稳定状态，
+// 返回是否真正收敛。
+//
+// 返回 false 有两种情形，均伴随告警日志（调度器已停止的情形除外）：
+//   - 调度器已停止，无从判断；
+//   - 达到轮询上限后放弃等待——此时系统状态未收敛，调用方不得
+//     基于「已稳定」的假设继续断言。
+//
+// 注意：依赖未满足的 Fiber 是稳定态（不是「不稳定」），
+// 因此存在等待外部事件的 Fiber 不会让 Wait 挂起。
+func (a *App) Wait() bool {
+	for i := 0; i < waitRounds; i++ {
 		stable := false
 		if !a.doSync(func(ctx *Context) {
 			stable = ctx.app.settled()
 		}) {
-			return // 调度器已停止，无从判断
+			return false // 调度器已停止
 		}
 		if stable {
-			return
+			return true
 		}
 	}
+	a.logger.Warn("wait: system still not settled after %d rounds, giving up", waitRounds)
+	return false
 }
 
 // Close 注销全部组件并停止调度器。可安全地重复调用：

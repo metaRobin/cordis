@@ -40,8 +40,9 @@ const (
 	StateLoading
 	// StateActive 组件逻辑执行成功且全部依赖仍然满足。
 	StateActive
-	// StateFailed 曾在 ACTIVE 之后执行失败（重载或 Update 中出错）；
-	// 效果已被回收，等待下次 Update 恢复。
+	// StateFailed 组件执行失败——首次加载、重载或 Update 中出错，
+	// 或配置未通过 Validate；产生的效果已被回收，等待下次
+	// Update 清除错误后重新启动。
 	StateFailed
 	// StateDisposed 已从父上下文注销，生命周期终结。
 	StateDisposed

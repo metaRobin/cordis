@@ -53,10 +53,11 @@ func newEvents(ctx *Context) *Events {
 	return &Events{ctx: ctx, hooks: make(map[string][]*hook)}
 }
 
-// On 注册监听器。prepend 为 true 时插队到最前。
-// 返回的 Dispose 可手动注销；Fiber 卸载时自动注销。
+// On 注册监听器（追加到注册序末尾），返回可手动注销的 Dispose；
+// Fiber 卸载时监听器自动注销。
+//
+// 失活校验由 Effect 内部统一执行（assertActive），此处不重复。
 func (e *Events) On(ctx *Context, name string, listener func(ctx *Context, args ...any) any) (Dispose, error) {
-	ctx.fiber.assertActive()
 	h := &hook{ctx: ctx, callback: listener}
 	return ctx.fiber.Effect("ctx.on("+name+")", func() (Dispose, error) {
 		e.hooks[name] = append(e.hooks[name], h)

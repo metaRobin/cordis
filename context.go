@@ -111,6 +111,13 @@ func (c *Context) InterceptOf(name string) (any, bool) {
 // Get 解析服务 name：从当前 Fiber 沿父链向上查找最近的可访问实现。
 // 域校验：仅接受注册域键与调用方一致的服务实现；跨越 fiber 边界
 // 时还要求父上下文的域键不变——同名服务在不同域中互不可见。
+//
+// 状态校验：命中**他人**（祖先 fiber 或依赖快照中的提供者）持有的
+// 实现时，要求提供者仍处于 ACTIVE——服务撤销分两阶段（先摘除全局
+// 可见性、待依赖者下线后再清理提供者自身的服务表），若不做此校验，
+// 撤销窗口内的旁观 fiber 会读到已被摘除的实现。命中自身提供的服务
+// 则放行（提供者自身的 LIFO 撤销仍需访问自己的服务）。
+//
 // 找不到时返回 (nil, false)，不区分「未注册」与「注册者未激活」——
 // 两者对依赖者而言都意味着依赖未满足。
 func (c *Context) Get(name string) (any, bool) {
@@ -119,10 +126,11 @@ func (c *Context) Get(name string) (any, bool) {
 	for {
 		if f.store != nil {
 			if impl, ok := f.store[name]; ok {
-				if impl.key == key {
+				if impl.key == key && (impl.fiber == c.fiber || impl.fiber.state == StateActive) {
 					return impl.value, true
 				}
-				// 同名服务注册在其他域：本域视作不存在，继续沿链查找。
+				// 同名服务注册在其他域，或提供者正在卸载：
+				// 本域视作不存在，继续沿链查找。
 			}
 		}
 		if _, injected := f.inject[name]; injected {

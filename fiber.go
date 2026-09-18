@@ -116,6 +116,10 @@ func newFiber(parent *Context, config any, inject map[string]any, rt *Runtime) *
 	for name := range inject {
 		f.checkImpl(name)
 	}
+	// 依赖倒排索引在此登记（而非更早）：保证索引中只出现构造完成
+	// 的 fiber，且与注册表注销路径上的 untrack 一一对应。
+	// 登记时机不影响依赖解析——调用方随后会执行 refresh 推导 epoch。
+	app.root.reflect.track(f)
 	return f
 }
 
@@ -423,7 +427,7 @@ func (f *Fiber) Effect(label string, execute func() (Dispose, error)) (Dispose, 
 		if d == nil {
 			return disposeStep{}, nil
 		}
-		return disposeStep{run: func() { safeDispose(d) }}, nil
+		return disposeStep{run: func() { f.safeDispose(label, d) }}, nil
 	})
 }
 
@@ -442,7 +446,7 @@ func (f *Fiber) EffectIter(label string, iter func(yield func(Dispose))) Dispose
 		}
 		return disposeStep{run: func() {
 			for i := len(disposables) - 1; i >= 0; i-- {
-				safeDispose(disposables[i])
+				f.safeDispose(label, disposables[i])
 			}
 		}}, nil
 	})
@@ -492,13 +496,16 @@ func (f *Fiber) effectStep(label string, execute func() (disposeStep, error)) (D
 	}, nil
 }
 
-func safeDispose(d Dispose) {
+// safeDispose 执行撤销且不让 panic 波及其余清理：撤销失败是
+// 环境残留（端口未释放、连接未关闭）的第一现场，因此一律记日志。
+// 单次失败不阻断剩余的撤销步骤。
+func (f *Fiber) safeDispose(label string, d Dispose) {
 	if d == nil {
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			// 撤销失败只记录，不阻断其余清理。
+			f.app.logger.Error("effect %q dispose panic: %v", label, r)
 		}
 	}()
 	d()

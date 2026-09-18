@@ -24,13 +24,67 @@ type impl struct {
 // 关键语义：所有键解析都以「调用方上下文」为基准——
 // provider 注册时用它自己的域键写入，dependant 检查满足度
 // 时用它自己的域键读取。同名服务在不同域中互不可见。
+//
+// index 是依赖声明的倒排索引（服务名 → 声明依赖它的 Fiber 列表，
+// 按创建序排列）：服务上下线只需通知真正声明了该服务的依赖者，
+// 而非全量扫描 Runtime × Fiber（原实现的 O(全部 Fiber) 每变更）。
 type Reflect struct {
 	ctx   *Context // 根上下文
 	store map[isolateKey]*impl
+	index map[string][]*Fiber
 }
 
 func newReflect(ctx *Context) *Reflect {
-	return &Reflect{ctx: ctx, store: make(map[isolateKey]*impl)}
+	return &Reflect{
+		ctx:   ctx,
+		store: make(map[isolateKey]*impl),
+		index: make(map[string][]*Fiber),
+	}
+}
+
+// track 按 f 的依赖声明登记倒排索引（Fiber 创建时调用一次）。
+func (r *Reflect) track(f *Fiber) {
+	for name := range f.inject {
+		r.index[name] = append(r.index[name], f)
+	}
+}
+
+// untrack 注销倒排索引（Fiber 注销时调用，与其创建一一对应）。
+func (r *Reflect) untrack(f *Fiber) {
+	for name := range f.inject {
+		list := r.index[name]
+		for i, cur := range list {
+			if cur != f {
+				continue
+			}
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+		if len(list) == 0 {
+			delete(r.index, name)
+			continue
+		}
+		r.index[name] = list
+	}
+}
+
+// candidates 返回声明依赖 names 中任一服务的 Fiber（按创建序去重）。
+func (r *Reflect) candidates(names []string) []*Fiber {
+	if len(names) == 1 {
+		return append([]*Fiber(nil), r.index[names[0]]...)
+	}
+	var out []*Fiber
+	seen := make(map[*Fiber]bool)
+	for _, name := range names {
+		for _, f := range r.index[name] {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // getImpl 以 ctx 的隔离域解析 name。strict 为 true 时
@@ -63,7 +117,7 @@ func (r *Reflect) Set(ctx *Context, name string, value any) error {
 		return fmt.Errorf("cannot set service %q without provide", name)
 	}
 	if im.fiber != ctx.fiber {
-		return fmt.Errorf("cannot set service %q in multiple fibers", name)
+		return fmt.Errorf("cannot set service %q registered by another fiber", name)
 	}
 	im.value = value
 	return nil
@@ -125,6 +179,7 @@ func (r *Reflect) Provide(ctx *Context, name string, value any, check func() boo
 // （供撤销流程等待它们下线）。
 //
 // 默认过滤规则：依赖者的域键与 provider 的域键一致。
+// 候选集取自倒排索引，代价为 O(声明依赖者数)，与 Fiber 总数无关。
 func (r *Reflect) notify(provider *Context, names []string, filter func(depCtx *Context, name string) bool) []*Fiber {
 	if filter == nil {
 		providerKey := make(map[string]isolateKey, len(names))
@@ -136,25 +191,23 @@ func (r *Reflect) notify(provider *Context, names []string, filter func(depCtx *
 		}
 	}
 	var fibers []*Fiber
-	for _, rt := range r.ctx.registry.order {
-		for _, f := range rt.fibers {
-			hasUpdate := false
-			for _, name := range names {
-				if _, ok := f.inject[name]; !ok {
-					continue
-				}
-				if !filter(f.ctx, name) {
-					continue
-				}
-				hasUpdate = true
-				f.checkImpl(name)
-			}
-			if !hasUpdate {
+	for _, f := range r.candidates(names) {
+		hasUpdate := false
+		for _, name := range names {
+			if _, ok := f.inject[name]; !ok {
 				continue
 			}
-			f.refresh()
-			fibers = append(fibers, f)
+			if !filter(f.ctx, name) {
+				continue
+			}
+			hasUpdate = true
+			f.checkImpl(name)
 		}
+		if !hasUpdate {
+			continue
+		}
+		f.refresh()
+		fibers = append(fibers, f)
 	}
 	// internal/service：按域过滤分发服务变更事件，
 	// 供依赖者以事件方式观察服务出现/消失。

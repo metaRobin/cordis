@@ -25,6 +25,11 @@ import (
 
 // EntryOptions 声明式入口配置。
 //
+// ID 是**全树唯一**的入口标识：EntryTree 以短 ID 为扁平索引键
+// （寻址则按 "group:child" 路径进行）。因此不同分组内不允许出现
+// 同名子入口——reconcile 与 Create 都会拒绝重复 ID（跳过并记日志）。
+// 留空时由 EntryTree 自动生成随机 ID。
+//
 // Isolate 值为 true 表示私有域（每个入口独享，键为 "#入口ID"），
 // 为字符串表示共享域（相同标签的入口互通，键为 "@标签"）。
 //
@@ -128,13 +133,26 @@ func (g *EntryGroup) reconcile(options []EntryOptions) {
 	}
 	// 再按配置序处理保留与新增。
 	children := make([]*Entry, 0, len(options))
+	seen := make(map[string]bool, len(options))
 	for _, opt := range options {
 		if opt.ID == "" {
 			opt.ID = tree.ensureID()
 		}
+		// 查重与 Create 对齐：store 以短 ID 为全局键，
+		// 同列表重复或跨组同名均拒绝（跳过并记日志），
+		// 避免静默覆盖索引使其与树结构脱钩。
+		if seen[opt.ID] {
+			tree.loader.ctx.app.logger.Error("duplicate entry id %q in group config", opt.ID)
+			continue
+		}
+		seen[opt.ID] = true
 		if e, ok := oldByID[opt.ID]; ok {
 			e.update(opt)
 			children = append(children, e)
+			continue
+		}
+		if _, dup := tree.store[opt.ID]; dup {
+			tree.loader.ctx.app.logger.Error("duplicate entry id %q (already exists in another group)", opt.ID)
 			continue
 		}
 		e := &Entry{loader: tree.loader, parent: g, options: opt}
@@ -253,8 +271,14 @@ func (e *Entry) init() {
 	}
 	f, err := e.ctx.Registry().PluginInject(e.ctx, p, e.options.Config, refineInject(p.Inject, e.options.Inject))
 	if err != nil {
-		e.loader.ctx.app.logger.Error("entry %s: %v", e.ID(), err)
-		return
+		if f == nil {
+			// 结构性失败：Fiber 从未注册，入口留空。
+			e.loader.ctx.app.logger.Error("entry %s: %v", e.ID(), err)
+			return
+		}
+		// 配置校验失败：Fiber 已登记为 FAILED（错误已在 PluginInject
+		// 记录），入口保留引用——后续配置修复经 Update 原地恢复，
+		// 无需重建实例。
 	}
 	e.fiber = f
 	e.loader.entryFibers[f] = e
@@ -281,22 +305,46 @@ func (e *Entry) disposeFiber() {
 	f.Dispose()
 }
 
+// detachSubgroup 同步摘下分组子树：注销全部子入口（树索引与父组
+// 立即一致），并把 subgroup 置空。
+//
+// 必要性：入口的树结构变更必须在**发起变更的这一刻**保持一致，
+// 而旧实例的效果回收是异步的（由调度器在后续任务中驱动）。
+// 上下文重建（ctxChanged）与跨组移动都会在旧子树尚未下线时
+// 实例化新子树——若不先同步摘下，新旧子入口会在短 ID 索引上
+// 冲突（查重拒绝新入口，或旧入口的清理误删新入口的索引）。
+//
+// 旧分组插件的清理回调以 entry.subgroup == g 为守卫，置空后
+// 不再重复处理已摘下的子组；Stop 本身亦幂等。
+func (e *Entry) detachSubgroup() {
+	if e.subgroup == nil {
+		return
+	}
+	g := e.subgroup
+	e.subgroup = nil
+	g.Stop()
+}
+
 // remove 从树中注销入口：先摘除 store 登记（internal/plugin
 // 监听据此区分「loader 移除」与「插件自卸载」），再注销 Fiber，
-// 分组的子入口沿效果链级联移除。
+// 分组的子入口递归摘下。
+//
+// 索引删除是幂等的：仅当 store 槽位仍指向本入口时才清除。
+// 重建路径上同 ID 的继任者可能已占据该槽位，旧入口的迟到清理
+// 不得误删之。
 func (e *Entry) remove() {
-	delete(e.parent.tree.store, e.options.ID)
-	e.disposeFiber()
-	if e.subgroup != nil {
-		e.subgroup.Stop()
+	if cur, ok := e.parent.tree.store[e.options.ID]; ok && cur == e {
+		delete(e.parent.tree.store, e.options.ID)
 	}
+	e.disposeFiber()
+	e.detachSubgroup()
 }
 
 // update 以新配置更新入口：
 //
-//   - 禁用（含级联）→ 注销 Fiber；
+//   - 禁用（含级联）→ 注销 Fiber 并摘下分组子树；
 //   - 空间声明变化（name/inject/isolate/intercept）→ 重建上下文
-//     并完整重载（先 LIFO 回收旧实例，再以新声明实例化）；
+//     并完整重载（先摘下旧子树与旧实例，再以新声明实例化）；
 //   - 仅配置变化 → Fiber 热重载；分组入口则协调子入口。
 func (e *Entry) update(options EntryOptions) {
 	legacy := e.options
@@ -309,17 +357,13 @@ func (e *Entry) update(options EntryOptions) {
 	e.options = options
 	if e.Disabled() {
 		e.disposeFiber()
-		if e.subgroup != nil {
-			e.subgroup.Stop()
-		}
+		e.detachSubgroup()
 		return
 	}
 	if e.fiber != nil {
 		if ctxChanged {
 			e.disposeFiber()
-			if e.subgroup != nil {
-				e.subgroup = nil
-			}
+			e.detachSubgroup()
 			e.init()
 			return
 		}
@@ -403,18 +447,40 @@ func init() {
 				if entry.subgroup != g {
 					return true
 				}
-				g.reconcile(entryOptionsOf(cfg))
+				g.reconcileConfig(cfg)
 				return false
 			})
-			g.reconcile(entryOptionsOf(config))
+			g.reconcileConfig(config)
 			return nil
 		},
 	}
 }
 
-func entryOptionsOf(config any) []EntryOptions {
-	list, _ := config.([]EntryOptions)
-	return list
+// entryOptionsOf 解析分组配置。nil 表示空列表（合法的空分组）；
+// 其他非 []EntryOptions 的值表示配置类型错误——返回 ok=false，
+// 由调用方决定处置，避免把类型错误静默当成空分组。
+func entryOptionsOf(config any) (list []EntryOptions, ok bool) {
+	if config == nil {
+		return nil, true
+	}
+	list, ok = config.([]EntryOptions)
+	return list, ok
+}
+
+// reconcileConfig 以分组配置协调子组。配置类型错误时记日志并
+// **保留**现有子入口——静默清场会把一次配置笔误放大为整棵子树
+// 的下线，且失败现场无从追溯。
+func (g *EntryGroup) reconcileConfig(config any) {
+	list, ok := entryOptionsOf(config)
+	if !ok {
+		id := "<root>"
+		if g.parentEntry != nil {
+			id = g.parentEntry.ID()
+		}
+		g.tree.ctx.app.logger.Error("group entry %s: config must be []EntryOptions, got %T (children kept)", id, config)
+		return
+	}
+	g.reconcile(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +492,11 @@ var ErrEntryNotFound = errors.New("cordis: cannot resolve entry")
 
 // EntryTree 入口树：根组 + 按 ID 索引的平铺存储。
 // 全路径 ID 以 ":" 分隔（如 "group-a:child"）。
+//
+// 两套寻址并存，约束不同：
+//   - Resolve/Create/Update/Remove 接受路径式 ID（"group-a:child"）；
+//   - store 索引以**短 ID** 为键，故短 ID 必须全树唯一
+//     （见 EntryOptions.ID）。
 type EntryTree struct {
 	ctx      *Context
 	loader   *Loader
@@ -558,8 +629,11 @@ func (t *EntryTree) Update(id string, options EntryOptions, parent string, posit
 		source.removeChild(e)
 		e.parent = target
 		target.insertChild(e, position)
-		// 上下文父链变化：注销 Fiber，update 走完整重建路径。
+		// 上下文父链变化：注销 Fiber 并同步摘下分组子树，
+		// update 走完整重建路径（旧实例的效果回收是异步的，
+		// 子树必须立即摘净，否则重建时短 ID 索引冲突）。
 		e.disposeFiber()
+		e.detachSubgroup()
 	}
 	e.update(options)
 	if moved {

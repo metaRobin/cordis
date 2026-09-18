@@ -83,6 +83,13 @@ func (r *Registry) Plugin(ctx *Context, p *Plugin, config any) (*Fiber, error) {
 // PluginInject 同 Plugin，但以 inject 覆盖插件声明的依赖表。
 // loader 层据此实现入口级依赖声明（EntryOptions.Inject）。
 // inject 为 nil 时沿用 Plugin.Inject。
+//
+// 返回值契约：
+//   - (nil, err)：结构性失败（插件无效或父上下文已失活），
+//     Fiber 从未创建/注册，调用方无需善后；
+//   - (f, err)：配置校验失败——Fiber 已注册并处于 FAILED 状态
+//     （错误同时经日志记录），可经 f.Update 修复或 f.Dispose 注销；
+//   - (f, nil)：成功。
 func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[string]any) (*Fiber, error) {
 	if p == nil || p.Apply == nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidPlugin, "<nil>")
@@ -102,12 +109,14 @@ func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[
 			inject[k] = v
 		}
 	}
+	var cfgErr error
 	f := newFiber(ctx, config, inject, rt)
 	d, err := ctx.fiber.effectStep("ctx.plugin()", func() (disposeStep, error) {
 		remove := rt.add(f)
 		cfg, err := resolveConfig(p, config)
 		if err != nil {
 			r.ctx.app.logger.Error("plugin %s config error: %v", p.Name, err)
+			cfgErr = err
 			f.err = err
 			f.setState(StateFailed)
 		} else {
@@ -118,6 +127,7 @@ func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[
 			run: func() {
 				f.disposed = true
 				f.uid = 0
+				r.ctx.reflect.untrack(f) // 依赖倒排索引随实例注销
 				f.ctx.Emit("internal/plugin", f)
 				if _, ok := r.runtimes[p]; ok {
 					remove()
@@ -134,10 +144,13 @@ func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[
 		}, nil
 	})
 	if err != nil {
-		return f, err
+		// 效果未注册（父上下文失活）：fiber 从未挂载，不可用。
+		// 依赖倒排索引需一并回退，保证 track/untrack 配对。
+		r.ctx.reflect.untrack(f)
+		return nil, err
 	}
 	f.dispose = d
-	return f, nil
+	return f, cfgErr
 }
 
 // Inject 声明动态依赖：deps 满足时执行 apply 并追踪其全部效果，

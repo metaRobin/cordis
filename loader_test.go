@@ -3,6 +3,7 @@ package cordis_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	cordis "cordis"
 )
@@ -206,6 +207,99 @@ func TestLoaderGroup(t *testing.T) {
 	}
 }
 
+// 回归（M-1 交互 + 审查测试缺口）：分组入口的空间声明变化
+// （isolate）走 ctxChanged 完整重建路径——旧子树必须被同步摘下，
+// 否则重建时新子入口会与旧子入口在短 ID 索引上冲突而被查重拒绝。
+func TestLoaderGroupIsolateRebuild(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var applied int
+	h.plugins["leaf"] = &cordis.Plugin{
+		Name: "leaf",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			applied++
+			_, err := ctx.Provide("leaf", applied, nil)
+			return err
+		},
+	}
+
+	child := []cordis.EntryOptions{{ID: "x", Name: "leaf"}}
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g", Name: "group", Group: true, Config: child},
+	})
+	e, err := h.loader.Tree().Resolve("g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f0 := e.Fiber()
+	if f0 == nil || applied != 1 {
+		t.Fatalf("initial load: fiber=%v applied=%d", f0, applied)
+	}
+
+	// 入口级 isolate 声明变化 → 上下文重建：分组 Fiber 与整个子树
+	// 以新声明重新实例化，旧实例完整下线。
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g", Name: "group", Group: true, Isolate: map[string]any{"leaf": "realm-a"}, Config: child},
+	})
+	f1 := e.Fiber()
+	if f1 == nil || f1 == f0 {
+		t.Fatalf("isolate change must rebuild the group fiber: %v -> %v", f0, f1)
+	}
+	if applied != 2 {
+		t.Fatalf("child must be re-instantiated under the new context: applied=%d", applied)
+	}
+	ce, err := h.loader.Tree().Resolve("g:x")
+	if err != nil {
+		t.Fatalf("subgroup child must survive the rebuild: %v", err)
+	}
+	if ce.Fiber() == nil || ce.Fiber().State() != cordis.StateActive {
+		t.Fatalf("rebuilt child should be active, got %v", ce.Fiber())
+	}
+	// 旧子入口的索引不得残留（短 ID 索引与树结构保持一致）。
+	if cur := h.loader.Tree().Root(); len(cur.Children()) != 1 {
+		t.Fatalf("root should hold exactly the group entry: %d", len(cur.Children()))
+	}
+}
+
+// 回归（N-3）：分组配置类型错误（非 []EntryOptions）不得被
+// 静默当成空列表——那会把一次配置笔误放大成整棵子树下线。
+func TestLoaderGroupConfigTypeError(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	h.plugins["leaf"] = &cordis.Plugin{
+		Name:  "leaf",
+		Apply: func(ctx *cordis.Context, _ any) error { return nil },
+	}
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g", Name: "group", Group: true, Config: []cordis.EntryOptions{
+			{ID: "c", Name: "leaf"},
+		}},
+	})
+	g, err := h.loader.Tree().Resolve("g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(g.Subgroup().Children()); n != 1 {
+		t.Fatalf("initial children: %d", n)
+	}
+
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g", Name: "group", Group: true, Config: "oops"},
+	})
+	if n := len(g.Subgroup().Children()); n != 1 {
+		t.Fatalf("config type error must keep children, got %d", n)
+	}
+	ce, err := h.loader.Tree().Resolve("g:c")
+	if err != nil {
+		t.Fatalf("child entry should survive the bad config: %v", err)
+	}
+	if ce.Fiber() == nil || ce.Fiber().State() != cordis.StateActive {
+		t.Fatalf("child should stay active, got %v", ce.Fiber())
+	}
+}
+
 func TestLoaderEntryIsolate(t *testing.T) {
 	h := newLoaderHarness(t)
 	defer h.close()
@@ -357,6 +451,130 @@ func TestLoaderTreeOperations(t *testing.T) {
 	}
 }
 
+// 回归：跨组移动（EntryTree.Update 的 moved 路径）也必须同步摘下
+// 分组子树——否则旧子树残留（子入口永不注销、短 ID 索引与树脱钩，
+// 且重建被查重拒绝）。
+func TestLoaderGroupMoveRebuild(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var applied int
+	h.plugins["leaf"] = &cordis.Plugin{
+		Name: "leaf",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			applied++
+			_, err := ctx.Provide("leaf", applied, nil)
+			return err
+		},
+	}
+
+	child := []cordis.EntryOptions{{ID: "c", Name: "leaf"}}
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "outer", Name: "group", Group: true},
+		{ID: "inner", Name: "group", Group: true, Config: child},
+	})
+	if applied != 1 {
+		t.Fatalf("initial load: applied=%d", applied)
+	}
+
+	// 把 inner 分组整体移入 outer。
+	if err := h.loader.Update("inner", cordis.EntryOptions{Name: "group", Group: true, Config: child}, "outer", -1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.loader.Tree().Resolve("outer:inner:c"); err != nil {
+		t.Fatalf("moved subtree must be rebuilt under the new parent: %v", err)
+	}
+	if applied != 2 {
+		t.Fatalf("child must be re-instantiated after the move: applied=%d", applied)
+	}
+	outer, err := h.loader.Tree().Resolve("outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(outer.Subgroup().Children()); n != 1 {
+		t.Fatalf("outer should hold exactly the moved group: %d", n)
+	}
+}
+
+// 回归（M-1）：reconcile 的重复短 ID 查重——
+// 跨组同名与同列表重复均拒绝（跳过并记日志），store 索引不被覆盖。
+func TestLoaderDuplicateShortID(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	h.plugins["leaf"] = &cordis.Plugin{
+		Name:  "leaf",
+		Apply: func(*cordis.Context, any) error { return nil },
+	}
+
+	// 两个分组各含同名子入口 "web"：后到者被拒，索引仍指向首组。
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g1", Name: "group", Group: true, Config: []cordis.EntryOptions{
+			{ID: "web", Name: "leaf"},
+		}},
+		{ID: "g2", Name: "group", Group: true, Config: []cordis.EntryOptions{
+			{ID: "web", Name: "leaf"},
+		}},
+	})
+	if _, err := h.loader.Tree().Resolve("g1:web"); err != nil {
+		t.Fatalf("g1:web should exist: %v", err)
+	}
+	if _, err := h.loader.Tree().Resolve("g2:web"); err == nil {
+		t.Fatal("cross-group duplicate short id must be rejected")
+	}
+	if _, err := h.loader.Create(cordis.EntryOptions{ID: "web", Name: "leaf"}, "", -1); err == nil {
+		t.Fatal("create with existing short id should fail")
+	}
+
+	// 同一配置列表内的重复 ID：子入口只实例化一次。
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "g1", Name: "group", Group: true, Config: []cordis.EntryOptions{
+			{ID: "web", Name: "leaf"},
+			{ID: "web", Name: "leaf"},
+		}},
+	})
+	g1, err := h.loader.Tree().Resolve("g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(g1.Subgroup().Children()); n != 1 {
+		t.Fatalf("duplicate ids in one config list must yield a single child: %d", n)
+	}
+}
+
+// 回归（M-2）：loader 路径的配置校验失败——入口保留 FAILED fiber
+// （状态可观测），配置修复后经 Update 原地恢复，不重建实例。
+func TestLoaderConfigErrorRecovery(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	h.plugins["strict"] = &cordis.Plugin{
+		Name: "strict",
+		Validate: func(config any) (any, error) {
+			if s, ok := config.(string); ok {
+				return s, nil
+			}
+			return nil, fmt.Errorf("config must be string")
+		},
+		Apply: func(*cordis.Context, any) error { return nil },
+	}
+
+	h.loader.Load([]cordis.EntryOptions{{ID: "s", Name: "strict", Config: 42}})
+	e, _ := h.loader.Tree().Resolve("s")
+	if e.Fiber() == nil || e.Fiber().State() != cordis.StateFailed {
+		t.Fatalf("invalid config should keep a FAILED fiber on entry: %v", e.Fiber())
+	}
+
+	f := e.Fiber()
+	h.loader.Load([]cordis.EntryOptions{{ID: "s", Name: "strict", Config: "ok"}})
+	if e.Fiber() != f {
+		t.Fatal("recovery should reuse the same fiber instance")
+	}
+	if f.State() != cordis.StateActive {
+		t.Fatalf("fixed config should activate fiber: %s", f.State())
+	}
+}
+
 func TestLoaderCommitHook(t *testing.T) {
 	h := newLoaderHarness(t)
 	defer h.close()
@@ -413,4 +631,77 @@ func TestLoaderSelfDispose(t *testing.T) {
 	if last.Legacy == nil || last.Options == nil || !last.Options.Disabled {
 		t.Fatalf("last commit should record disable: %+v", last)
 	}
+}
+
+// 回归（H-1 的 loader 路径）：单次 Load 协调 1100 个入口——每个
+// 入口在同一个调度任务内投递一次 pump，无界队列不得自死锁。
+func TestLoaderLargeLoad(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	h.plugins["leaf"] = &cordis.Plugin{
+		Name:  "leaf",
+		Apply: func(ctx *cordis.Context, _ any) error { return nil },
+	}
+
+	const n = 1100
+	opts := make([]cordis.EntryOptions, 0, n)
+	for i := 0; i < n; i++ {
+		opts = append(opts, cordis.EntryOptions{ID: fmt.Sprintf("e%d", i), Name: "leaf"})
+	}
+
+	done := make(chan struct{})
+	var (
+		loadErr   error
+		children  int
+		activeCnt int
+	)
+	go func() {
+		defer close(done)
+		h.loader.Load(opts)
+		children = len(h.loader.Tree().Root().Children())
+		for i := 0; i < n; i++ {
+			e, err := h.loader.Tree().Resolve(fmt.Sprintf("e%d", i))
+			if err != nil {
+				loadErr = err
+				return
+			}
+			if e.Fiber() != nil && e.Fiber().State() == cordis.StateActive {
+				activeCnt++
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock: 1100-entry Load blocked the scheduler")
+	}
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if children != n {
+		t.Fatalf("root children: %d, want %d", children, n)
+	}
+	if activeCnt != n {
+		t.Fatalf("active entries: %d, want %d", activeCnt, n)
+	}
+}
+
+// BenchmarkLoaderLoad 度量声明式协调的吞吐：每个入口一次
+// 实例化 + 索引登记（H-1 修复后不再受固定队列容量限制）。
+func BenchmarkLoaderLoad(b *testing.B) {
+	b.Run("load-100", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			h := &loaderHarness{app: cordis.New(), plugins: map[string]*cordis.Plugin{}}
+			h.loader = cordis.NewLoader(h.app, func(string) (*cordis.Plugin, error) {
+				return &cordis.Plugin{Name: "leaf", Apply: func(*cordis.Context, any) error { return nil }}, nil
+			})
+			opts := make([]cordis.EntryOptions, 0, 100)
+			for j := 0; j < 100; j++ {
+				opts = append(opts, cordis.EntryOptions{ID: fmt.Sprintf("e%d", j), Name: "leaf"})
+			}
+			h.loader.Load(opts)
+			h.app.Close()
+		}
+	})
 }
